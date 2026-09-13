@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Specto Ball Tracker</title>
+  <script src="https://docs.opencv.org/4.5.4/opencv.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+  <style>
+    video, canvas { width: 100%; max-width: 600px; display: block; }
+  </style>
+</head>
+<body>
+  <h2>Specto Camera Tracker</h2>
+  <video id="video" playsinline></video>
+  <canvas id="canvasOut"></canvas>
+  <button onclick="startShot()">Start Shot</button>
+
+  <script>
+    // 1. Firebase Configuration
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+      projectId: "YOUR_PROJECT"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    let currentShotId = null;
+    function startShot() {
+      currentShotId = "shot_" + Date.now();
+      db.ref("activeShot").set(currentShotId);
+    }
+
+    // 2. Camera Access
+    const video = document.getElementById('video');
+    navigator.mediaDevices.getUserMedia({ 
+      video: { facingMode: "environment", width: 1280, height: 720, frameRate: { ideal: 60 } } 
+    }).then(stream => { video.srcObject = stream; video.play(); });
+
+    // 3. OpenCV Tracking & Homography Transformation
+    function onOpenCvReady() {
+      cv['onRuntimeInitialized'] = () => {
+        let cap = new cv.VideoCapture(video);
+        let src = new cv.Mat(720, 1280, cv.CV_8UC4);
+        let hsv = new cv.Mat(), mask = new cv.Mat();
+
+        // Homography Setup: 4 points on Camera Frame -> 4 points on 2D Lane (Board 1-39, 0-60 ft)
+        // Adjust srcTri based on your physical tripod angle calibration
+        let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [200,600, 1080,600, 450,100, 830,100]); 
+        let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0,0, 39,0, 0,60, 39,60]); 
+        let H = cv.getPerspectiveTransform(srcTri, dstTri);
+
+        function processFrame() {
+          cap.read(src);
+          cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+          cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+
+          // HSV filter for yellow/bright bowling ball (Adjust HSV bounds as needed)
+          let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [20, 100, 100, 0]);
+          let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [30, 255, 255, 0]);
+          cv.inRange(hsv, low, high, mask);
+
+          let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+          cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+          if (contours.size() > 0 && currentShotId) {
+            let circle = cv.minEnclosingCircle(contours.get(0));
+            
+            // Map camera point to lane coordinate using Matrix H
+            let pt = cv.matFromArray(1, 1, cv.CV_32FC2, [circle.center.x, circle.center.y]);
+            let dstPt = new cv.Mat();
+            cv.perspectiveTransform(pt, dstPt, H);
+
+            let laneX = dstPt.data32F[0]; // Board (0 - 39)
+            let laneY = dstPt.data32F[1]; // Feet (0 - 60)
+
+            db.ref(`shots/${currentShotId}/points`).push({ x: laneX, y: laneY, t: Date.now() });
+            
+            pt.delete(); dstPt.delete();
+          }
+          contours.delete(); hierarchy.delete(); low.delete(); high.delete();
+          requestAnimationFrame(processFrame);
+        }
+        setTimeout(processFrame, 1000);
+      };
+    }
+    window.onload = onOpenCvReady;
+  </script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Specto Live Viewer</title>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+  <style>
+    body { background: #111; color: white; text-align: center; }
+    canvas { background: #222; border: 2px solid #555; }
+  </style>
+</head>
+<body>
+  <h2>Specto Live Trajectory</h2>
+  <canvas id="laneCanvas" width="300" height="700"></canvas>
+
+  <script>
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+      projectId: "YOUR_PROJECT"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    const canvas = document.getElementById('laneCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // Scale 39 boards to canvas width, 60 feet to canvas height
+    const scaleX = canvas.width / 39;
+    const scaleY = canvas.height / 60;
+
+    db.ref("activeShot").on("value", snapshot => {
+      const shotId = snapshot.val();
+      if (!shotId) return;
+
+      // Clear Canvas for new shot
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      db.ref(`shots/${shotId}/points`).on("child_added", pointSnap => {
+        const pt = pointSnap.val();
+        const px = pt.x * scaleX;
+        const py = canvas.height - (pt.y * scaleY); // Flip Y (0ft foul line at bottom)
+
+        // Draw Specto-style neon ball path
+        ctx.beginPath();
+        ctx.arc(px, py, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = '#00e5ff';
+        ctx.shadowColor = '#00e5ff';
+        ctx.shadowBlur = 8;
+        ctx.fill();
+      });
+    });
+  </script>
+</body>
+</html>

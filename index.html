@@ -1,22 +1,39 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Specto Ball Tracker</title>
+  <title>Specto Camera Tracker</title>
   <script src="https://docs.opencv.org/4.5.4/opencv.js"></script>
   <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
   <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
   <style>
-    video, canvas { width: 100%; max-width: 600px; display: block; }
+    body { font-family: sans-serif; text-align: center; margin: 0; background: #1a1a1a; color: white; }
+    .video-container { position: relative; display: inline-block; }
+    video, canvas { max-width: 100%; height: auto; display: block; }
+    #calibCanvas { position: absolute; top: 0; left: 0; z-index: 10; cursor: crosshair; }
+    .controls { margin: 10px; }
+    button { padding: 10px 16px; font-size: 16px; margin: 5px; background: #00e5ff; border: none; font-weight: bold; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #00b3cc; }
+    #status { font-weight: bold; color: #00e5ff; }
   </style>
 </head>
 <body>
   <h2>Specto Camera Tracker</h2>
-  <video id="video" playsinline></video>
-  <canvas id="canvasOut"></canvas>
-  <button onclick="startShot()">Start Shot</button>
+  
+  <div class="video-container">
+    <video id="video" playsinline></video>
+    <canvas id="calibCanvas"></canvas>
+  </div>
+
+  <div class="controls">
+    <button onclick="resetCalibration()">Reset Calibration</button>
+    <button onclick="startShot()">Start Shot</button>
+  </div>
+  
+  <p id="status">Tap 4 lane corners on stream: Foul Left, Foul Right, Pins Left, Pins Right.</p>
 
   <script>
     // 1. Firebase Configuration
+    const firebaseConfig = {
       apiKey: "AIzaSyD-N9N3wyM9FGIonLWDdKlAjQi9GNSFbqU",
       authDomain: "bowling-target.firebaseapp.com",
       databaseURL: "https://bowling-target-default-rtdb.asia-southeast1.firebasedatabase.app/",
@@ -25,60 +42,127 @@
     firebase.initializeApp(firebaseConfig);
     const db = firebase.database();
 
-    let currentShotId = null;
-    function startShot() {
-      currentShotId = "shot_" + Date.now();
-      db.ref("activeShot").set(currentShotId);
-    }
-
-    // 2. Camera Access
     const video = document.getElementById('video');
+    const calibCanvas = document.getElementById('calibCanvas');
+    const calibCtx = calibCanvas.getContext('2d');
+    
+    let calibPoints = [];
+    let H = null;
+    let currentShotId = null;
+
+    // 2. Camera Access Setup
     navigator.mediaDevices.getUserMedia({ 
       video: { facingMode: "environment", width: 1280, height: 720, frameRate: { ideal: 60 } } 
-    }).then(stream => { video.srcObject = stream; video.play(); });
+    }).then(stream => { 
+      video.srcObject = stream; 
+      video.play();
+      video.onloadedmetadata = () => {
+        calibCanvas.width = video.videoWidth;
+        calibCanvas.height = video.videoHeight;
+      };
+    });
 
-    // 3. OpenCV Tracking & Homography Transformation
+    // 3. Interactive 4-Point Tap Calibration (Feature #2)
+    calibCanvas.addEventListener('click', (e) => {
+      if (calibPoints.length >= 8) return; // 4 points = 8 values (x,y)
+      
+      const rect = calibCanvas.getBoundingClientRect();
+      const scaleX = calibCanvas.width / rect.width;
+      const scaleY = calibCanvas.height / rect.height;
+      
+      const x = (e.clientX - rect.left) * scaleX;
+      const y = (e.clientY - rect.top) * scaleY;
+      calibPoints.push(x, y);
+
+      drawCalibrationPoints();
+      
+      if (calibPoints.length === 8) {
+        computeHomography();
+      }
+    });
+
+    function drawCalibrationPoints() {
+      calibCtx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
+      calibCtx.fillStyle = '#ff0055';
+      for (let i = 0; i < calibPoints.length; i += 2) {
+        calibCtx.beginPath();
+        calibCtx.arc(calibPoints[i], calibPoints[i+1], 6, 0, 2 * Math.PI);
+        calibCtx.fill();
+      }
+    }
+
+    function resetCalibration() {
+      calibPoints = [];
+      if (H) { H.delete(); H = null; }
+      calibCtx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
+      document.getElementById('status').innerText = "Calibration reset. Tap 4 lane corners on stream.";
+    }
+
+    function computeHomography() {
+      let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, calibPoints);
+      // Lane mapping: 0 to 39 boards (width), 0 to 60 feet (length)
+      let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0,0, 39,0, 0,60, 39,60]);
+      H = cv.getPerspectiveTransform(srcTri, dstTri);
+      srcTri.delete(); dstTri.delete();
+      document.getElementById('status').innerText = "Calibration Complete! Ready to Track.";
+    }
+
+    // 4. Shot Management (Feature #3: Shot History sync)
+    function startShot() {
+      if (!H) return alert("Please tap 4 points to complete calibration first!");
+      currentShotId = "shot_" + Date.now();
+      
+      // Store timestamp and active ID to allow historical comparisons
+      db.ref("shots/" + currentShotId).set({ timestamp: Date.now() });
+      db.ref("activeShot").set(currentShotId);
+      document.getElementById('status').innerText = "Tracking active shot...";
+    }
+
+    // 5. OpenCV Tracking & Perspective Mapping (Feature #1 Analytics Feed)
     function onOpenCvReady() {
       cv['onRuntimeInitialized'] = () => {
         let cap = new cv.VideoCapture(video);
         let src = new cv.Mat(720, 1280, cv.CV_8UC4);
         let hsv = new cv.Mat(), mask = new cv.Mat();
 
-        // Homography Setup: 4 points on Camera Frame -> 4 points on 2D Lane (Board 1-39, 0-60 ft)
-        // Adjust srcTri based on your physical tripod angle calibration
-        let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [200,600, 1080,600, 450,100, 830,100]); 
-        let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0,0, 39,0, 0,60, 39,60]); 
-        let H = cv.getPerspectiveTransform(srcTri, dstTri);
-
         function processFrame() {
-          cap.read(src);
-          cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
-          cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+          if (H && currentShotId) {
+            cap.read(src);
+            cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+            cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
 
-          // HSV filter for yellow/bright bowling ball (Adjust HSV bounds as needed)
-          let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [20, 100, 100, 0]);
-          let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [30, 255, 255, 0]);
-          cv.inRange(hsv, low, high, mask);
+            // HSV filter for yellow/bright bowling ball (Adjust ranges if needed)
+            let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [15, 100, 100, 0]);
+            let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [35, 255, 255, 0]);
+            cv.inRange(hsv, low, high, mask);
 
-          let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-          cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+            let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+            cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-          if (contours.size() > 0 && currentShotId) {
-            let circle = cv.minEnclosingCircle(contours.get(0));
-            
-            // Map camera point to lane coordinate using Matrix H
-            let pt = cv.matFromArray(1, 1, cv.CV_32FC2, [circle.center.x, circle.center.y]);
-            let dstPt = new cv.Mat();
-            cv.perspectiveTransform(pt, dstPt, H);
+            if (contours.size() > 0) {
+              let circle = cv.minEnclosingCircle(contours.get(0));
+              
+              // Map camera pixel coordinates to physical 2D lane coordinates via Matrix H
+              let pt = cv.matFromArray(1, 1, cv.CV_32FC2, [circle.center.x, circle.center.y]);
+              let dstPt = new cv.Mat();
+              cv.perspectiveTransform(pt, dstPt, H);
 
-            let laneX = dstPt.data32F[0]; // Board (0 - 39)
-            let laneY = dstPt.data32F[1]; // Feet (0 - 60)
+              let laneX = dstPt.data32F[0]; // Board (0 - 39)
+              let laneY = dstPt.data32F[1]; // Feet (0 - 60)
 
-            db.ref(`shots/${currentShotId}/points`).push({ x: laneX, y: laneY, t: Date.now() });
-            
-            pt.delete(); dstPt.delete();
+              // Streams frame metrics (x, y, timestamp) for speed and entry angle calculations
+              if (laneY >= 0 && laneY <= 60) {
+                db.ref(`shots/${currentShotId}/points`).push({ 
+                  x: laneX, 
+                  y: laneY, 
+                  t: Date.now() 
+                });
+              }
+
+              pt.delete(); dstPt.delete();
+            }
+            contours.delete(); hierarchy.delete(); low.delete(); high.delete();
           }
-          contours.delete(); hierarchy.delete(); low.delete(); high.delete();
           requestAnimationFrame(processFrame);
         }
         setTimeout(processFrame, 1000);
